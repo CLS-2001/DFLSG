@@ -1,0 +1,187 @@
+import logging
+import torch
+import torchvision.transforms as T
+from torch.utils.data import DataLoader
+from datasets.sampler import RandomIdentitySampler
+from datasets.sampler_ddp import RandomIdentitySampler_DDP, RandomMultipleGallerySampler
+from torch.utils.data.distributed import DistributedSampler
+from datasets import IterLoader
+
+from utils.comm import get_world_size
+
+from .bases import ImageDataset, TextDataset, ImageTextDataset, CLTextDataset, ImageTextMLMDataset, CLImageDataset
+
+from .cuhkpedes import CUHKPEDES
+from .icfgpedes import ICFGPEDES
+from .rstpreid import RSTPReid
+from .ufine import UFine6926
+
+__factory = {'CUHK-PEDES': CUHKPEDES, 'ICFG-PEDES': ICFGPEDES, 'RSTPReid': RSTPReid, 'UFine6926': UFine6926}
+
+
+def build_transforms(img_size=(384, 128), aug=False, is_train=True):
+    height, width = img_size
+
+    mean = [0.48145466, 0.4578275, 0.40821073]
+    std = [0.26862954, 0.26130258, 0.27577711]
+
+    if not is_train:
+        transform = T.Compose([
+            T.Resize((height, width)),
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+        ])
+        return transform
+
+    # transform for training
+    if aug:
+        transform = T.Compose([
+            T.Resize((height, width)),
+            T.RandomHorizontalFlip(0.5),
+            T.Pad(10),
+            T.RandomCrop((height, width)),
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+            T.RandomErasing(scale=(0.02, 0.4), value=mean),
+        ])
+    else:
+        transform = T.Compose([
+            T.Resize((height, width)),
+            T.RandomHorizontalFlip(0.5),
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+        ])
+    return transform
+
+
+def collate(batch):
+    keys = set([key for b in batch for key in b.keys()])
+    # turn list of dicts data structure to dict of lists data structure
+    dict_batch = {k: [dic[k] if k in dic else None for dic in batch] for k in keys}
+
+    batch_tensor_dict = {}
+    for k, v in dict_batch.items():
+        if isinstance(v[0], int):
+            batch_tensor_dict.update({k: torch.tensor(v)})
+        elif torch.is_tensor(v[0]):
+             batch_tensor_dict.update({k: torch.stack(v)})
+        else:
+            raise TypeError(f"Unexpect data type: {type(v[0])} in a batch.")
+
+    return batch_tensor_dict
+
+def build_train_dataloader(args, target_data):
+
+    train_transforms = build_transforms(img_size=args.img_size,
+                                        aug=args.img_aug,
+                                        is_train=True)
+
+    train_set = ImageTextMLMDataset(target_data,
+                                    train_transforms,
+                                    text_length=args.text_length)
+    train_loader = DataLoader(train_set,
+                              batch_size=args.batch_size,
+                              sampler=RandomIdentitySampler(
+                                  target_data, args.batch_size,
+                                  args.num_instance),
+                              num_workers=args.num_workers,
+                              collate_fn=collate, drop_last=True)
+    return  train_loader
+
+
+def build_test_dataloader(args, target_data):
+    height, width = args.img_size
+
+    mean = [0.48145466, 0.4578275, 0.40821073]
+    std = [0.26862954, 0.26130258, 0.27577711]
+
+    test_transformer = T.Compose([
+        T.Resize((height, width)),
+        T.ToTensor(),
+        T.Normalize(mean, std)
+    ])
+
+    ds = target_data.val if args.val_dataset == 'val' else target_data.test
+
+    val_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
+                               test_transformer)
+
+    val_txt_set = TextDataset(ds['caption_pids'],
+                              ds['captions'],
+                              text_length=args.text_length)
+
+    val_img_loader = DataLoader(val_img_set,
+                                batch_size=args.test_batch_size,
+                                shuffle=False,
+                                num_workers=args.num_workers)
+    val_txt_loader = DataLoader(val_txt_set,
+                                batch_size=args.test_batch_size,
+                                shuffle=False,
+                                num_workers=args.num_workers)
+
+    return val_img_loader , val_txt_loader
+
+def build_cluster_dataloader(args, target_data):
+    height, width = args.img_size
+
+    mean = [0.48145466, 0.4578275, 0.40821073]
+    std = [0.26862954, 0.26130258, 0.27577711]
+
+    test_transformer = T.Compose([
+        T.Resize((height, width)),
+        T.ToTensor(),
+        T.Normalize(mean, std)
+    ])
+
+    ds = target_data
+
+    cl_img_set = CLImageDataset(ds['img_paths'], args, test_transformer)
+
+
+    cl_img_loader = DataLoader(cl_img_set,
+                               batch_size=args.test_batch_size,
+                               shuffle=False,
+                               pin_memory=True,
+                               num_workers=args.num_workers)
+
+    cl_txt_set = CLTextDataset(ds['captions'])
+
+    cl_txt_loader = DataLoader(cl_txt_set,
+                               batch_size=args.test_batch_size,
+                               shuffle=False,
+                               pin_memory=True,
+                               num_workers=args.num_workers)
+
+    return cl_img_loader,cl_txt_loader
+
+def build_dataloader(args, tranforms=None):
+    logger = logging.getLogger("DFLSG.dataset")
+
+    num_workers = args.num_workers
+    url = args.root_dir + args.target_dataset_name
+    dataset = __factory[args.target_dataset_name](url)
+
+
+    # build dataloader for testing
+    if tranforms:
+        test_transforms = tranforms
+    else:
+        test_transforms = build_transforms(img_size=args.img_size,
+                                               is_train=False)
+
+    ds = dataset.test
+    test_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
+                                    test_transforms)
+    test_txt_set = TextDataset(ds['caption_pids'],
+                                   ds['captions'],
+                                   text_length=args.text_length)
+
+    test_img_loader = DataLoader(test_img_set,
+                                     batch_size=args.test_batch_size,
+                                     shuffle=False,
+                                     num_workers=num_workers)
+    test_txt_loader = DataLoader(test_txt_set,
+                                     batch_size=args.test_batch_size,
+                                     shuffle=False,
+                                     num_workers=num_workers)
+    return test_img_loader, test_txt_loader
